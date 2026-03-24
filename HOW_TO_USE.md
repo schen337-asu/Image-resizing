@@ -70,6 +70,10 @@ is saved to:
 - JPEG metadata such as EXIF and ICC profile is preserved when available.
 - If the folder picker is canceled or unavailable, the app asks for a manual directory path.
 
+## Resizer2 (Real-ESRGAN Version)
+
+For the Real-ESRGAN-powered variant, run `resizer2.py` and follow `README_resizer2.md`.
+
 ## Troubleshooting
 
 - If imports fail, ensure the virtual environment is activated and dependencies are installed:

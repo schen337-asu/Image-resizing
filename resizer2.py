@@ -1,0 +1,314 @@
+"""Batch resize JPEG images and optionally enhance with Real-ESRGAN.
+
+The script prompts for:
+1) A directory selected from a folder picker UI
+2) A positive multiplier ratio (for example: 0.5, 1.25, 2)
+3) Whether to apply Real-ESRGAN enhancement and blend strength
+
+It resizes every .jpg/.jpeg image in that directory (including child folders)
+and saves output files in the alternate sibling directory named
+<original folder name>+<multiplier>, preserving relative subfolder structure.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+import subprocess
+import sys
+import types
+
+import cv2
+import numpy as np
+from PIL import Image, ImageOps
+
+
+DEFAULT_REALESRGAN_MODEL_URL = (
+	"https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/"
+	"RealESRGAN_x4plus.pth"
+)
+
+
+def parse_ratio_text(value: str) -> float:
+	"""Parse and validate a positive resize multiplier ratio."""
+	try:
+		ratio = float(value.strip())
+	except ValueError as exc:
+		raise ValueError("Multiplier ratio must be a number, e.g. 0.5 or 1.25") from exc
+
+	if ratio <= 0:
+		raise ValueError("Multiplier ratio must be greater than 0")
+	return ratio
+
+
+def ratio_suffix(ratio: float) -> str:
+	"""Create a filename-safe, human-readable suffix for the ratio."""
+	ratio_str = f"{ratio:.4f}".rstrip("0").rstrip(".")
+	return ratio_str.replace(".", "p")
+
+
+def ratio_label(ratio: float) -> str:
+	"""Create a readable multiplier label for directory naming."""
+	return f"{ratio:.4f}".rstrip("0").rstrip(".")
+
+
+def resized_dimensions(width: int, height: int, ratio: float) -> tuple[int, int]:
+	"""Return clamped target dimensions based on the ratio."""
+	new_width = max(1, round(width * ratio))
+	new_height = max(1, round(height * ratio))
+	return new_width, new_height
+
+
+def parse_yes_no(value: str) -> bool:
+	"""Parse yes/no text input into a boolean."""
+	answer = value.strip().lower()
+	if answer in {"", "y", "yes"}:
+		return True
+	if answer in {"n", "no"}:
+		return False
+	raise ValueError("Please answer with y/yes or n/no")
+
+
+def parse_blend_strength(value: str) -> float:
+	"""Parse and validate Real-ESRGAN blend strength in the range 0.0–1.0."""
+	stripped = value.strip()
+	if stripped == "":
+		return 0.6
+	try:
+		strength = float(stripped)
+	except ValueError as exc:
+		raise ValueError("Blend strength must be a number, e.g. 0.5 or 1.0") from exc
+	if strength < 0.0 or strength > 1.0:
+		raise ValueError("Blend strength must be between 0.0 and 1.0")
+	return strength
+
+
+def pick_directory() -> Path:
+	"""Open a folder picker UI and return the selected directory path.
+
+	Uses native macOS chooser via osascript and falls back to manual input.
+	"""
+	selected = ""
+	try:
+		result = subprocess.run(
+			[
+				"osascript",
+				"-e",
+				'POSIX path of (choose folder with prompt "Select folder containing JPEG images")',
+			],
+			capture_output=True,
+			text=True,
+			check=False,
+		)
+		if result.returncode == 0:
+			selected = result.stdout.strip()
+	except FileNotFoundError:
+		selected = ""
+
+	if not selected:
+		selected = input("Folder picker cancelled/unavailable. Enter directory path: ").strip()
+
+	if not selected:
+		raise SystemExit("No directory selected.")
+
+	return Path(selected).expanduser().resolve()
+
+
+def iter_jpegs(directory: Path) -> list[Path]:
+	"""Collect .jpg/.jpeg files recursively from a directory tree."""
+	return sorted(
+		path
+		for path in directory.rglob("*")
+		if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg"}
+	)
+
+
+class RealESRGANEnhancer:
+	"""Real-ESRGAN enhancement wrapper with optional blending."""
+
+	def _ensure_torchvision_compat(self) -> None:
+		"""Provide compatibility for basicsr expecting torchvision functional_tensor."""
+		try:
+			from torchvision.transforms import functional as tv_functional
+		except Exception:  # noqa: BLE001
+			return
+
+		module_name = "torchvision.transforms.functional_tensor"
+		if module_name in sys.modules:
+			return
+
+		compat_module = types.ModuleType(module_name)
+		if hasattr(tv_functional, "rgb_to_grayscale"):
+			compat_module.rgb_to_grayscale = tv_functional.rgb_to_grayscale
+		sys.modules[module_name] = compat_module
+
+	def __init__(self, model_url: str = DEFAULT_REALESRGAN_MODEL_URL) -> None:
+		self._ensure_torchvision_compat()
+		try:
+			import torch
+			from basicsr.archs.rrdbnet_arch import RRDBNet
+			from realesrgan import RealESRGANer
+		except ImportError as exc:
+			raise RuntimeError(
+				"Missing required packages for Real-ESRGAN enhancement. "
+				"Install with: pip install torch realesrgan basicsr"
+			) from exc
+
+		self._torch = torch
+		self._model_scale = 4
+		self._rrdb_model = RRDBNet(
+			num_in_ch=3,
+			num_out_ch=3,
+			num_feat=64,
+			num_block=23,
+			num_grow_ch=32,
+			scale=self._model_scale,
+		)
+		self._upsampler = RealESRGANer(
+			scale=self._model_scale,
+			model_path=model_url,
+			model=self._rrdb_model,
+			tile=0,
+			tile_pad=10,
+			pre_pad=0,
+			half=self._torch.cuda.is_available(),
+		)
+
+	def enhance(self, image: Image.Image, ratio: float, blend_strength: float) -> Image.Image:
+		"""Run Real-ESRGAN from original image and blend with baseline resize."""
+		rgb = image.convert("RGB")
+		target_size = resized_dimensions(rgb.width, rgb.height, ratio)
+		baseline = rgb.resize(target_size, resample=Image.Resampling.LANCZOS)
+
+		rgb_np = np.array(rgb)
+		bgr_np = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)
+
+		enhanced_bgr, _ = self._upsampler.enhance(bgr_np, outscale=ratio)
+		enhanced_rgb = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2RGB)
+		enhanced = Image.fromarray(enhanced_rgb)
+
+		if enhanced.size != baseline.size:
+			enhanced = enhanced.resize(baseline.size, resample=Image.Resampling.LANCZOS)
+
+		if blend_strength <= 0.0:
+			return baseline
+		if blend_strength >= 1.0:
+			return enhanced
+		return Image.blend(baseline, enhanced, blend_strength)
+
+
+
+def resize_one_jpeg(
+	image_path: Path,
+	ratio: float,
+	apply_enhancement: bool,
+	output_directory: Path,
+	enhancer: RealESRGANEnhancer | None,
+	blend_strength: float,
+) -> Path:
+	"""Resize one JPEG and optionally run Real-ESRGAN enhancement."""
+	with Image.open(image_path) as img:
+		img = ImageOps.exif_transpose(img)
+		if apply_enhancement and enhancer is not None:
+			resized = enhancer.enhance(img, ratio, blend_strength)
+		else:
+			new_size = resized_dimensions(img.width, img.height, ratio)
+			resized = img.resize(new_size, resample=Image.Resampling.LANCZOS)
+
+		output_name = f"{image_path.stem}_x{ratio_suffix(ratio)}.jpg"
+		output_path = output_directory / output_name
+
+		save_kwargs = {
+			"format": "JPEG",
+			"quality": 95,
+			"subsampling": 0,
+			"optimize": True,
+			"progressive": True,
+		}
+		if "icc_profile" in img.info:
+			save_kwargs["icc_profile"] = img.info["icc_profile"]
+		if "exif" in img.info:
+			save_kwargs["exif"] = img.info["exif"]
+
+		if resized.mode not in ("RGB", "L"):
+			resized = resized.convert("RGB")
+
+		resized.save(output_path, **save_kwargs)
+		return output_path
+
+
+def run() -> None:
+	"""Prompt user for inputs and process JPEG files in the selected directory."""
+	directory = pick_directory()
+	ratio_input = input("Enter the multiplier ratio (e.g. 0.5, 1.25, 2): ").strip()
+	enhance_input = input("Apply Real-ESRGAN enhancement? [Y/n] (recommended): ").strip()
+
+	if not directory.exists() or not directory.is_dir():
+		raise SystemExit(f"Error: '{directory}' is not a valid directory.")
+
+	try:
+		ratio = parse_ratio_text(ratio_input)
+	except ValueError as err:
+		raise SystemExit(f"Error: {err}") from err
+
+	try:
+		apply_enhancement = parse_yes_no(enhance_input)
+	except ValueError as err:
+		raise SystemExit(f"Error: {err}") from err
+
+	blend_strength = 0.6
+	if apply_enhancement:
+		strength_input = input("Real-ESRGAN blend strength [0.0–1.0, default 0.6]: ").strip()
+		try:
+			blend_strength = parse_blend_strength(strength_input)
+		except ValueError as err:
+			raise SystemExit(f"Error: {err}") from err
+
+	images = iter_jpegs(directory)
+	if not images:
+		raise SystemExit("No JPEG files (.jpg/.jpeg) found in the specified directory.")
+
+	enhancer: RealESRGANEnhancer | None = None
+	if apply_enhancement:
+		try:
+			enhancer = RealESRGANEnhancer()
+		except RuntimeError as err:
+			raise SystemExit(f"Error: {err}") from err
+
+	original_folder_name = directory.name or "root"
+	output_directory = directory.parent / f"{original_folder_name}+{ratio_label(ratio)}"
+	output_directory.mkdir(parents=True, exist_ok=True)
+
+	if apply_enhancement:
+		mode = f"with Real-ESRGAN enhancement (blend strength {blend_strength})"
+	else:
+		mode = "without enhancement"
+	print(f"Found {len(images)} JPEG file(s). Resizing with ratio {ratio} ({mode})...")
+	print(f"Output directory: {output_directory}")
+	successes = 0
+	failures = 0
+
+	for image_path in images:
+		try:
+			relative_parent = image_path.relative_to(directory).parent
+			target_directory = output_directory / relative_parent
+			target_directory.mkdir(parents=True, exist_ok=True)
+
+			output_path = resize_one_jpeg(
+				image_path,
+				ratio,
+				apply_enhancement,
+				target_directory,
+				enhancer,
+				blend_strength,
+			)
+			successes += 1
+			print(f"OK: {image_path} -> {output_path}")
+		except Exception as err:  # noqa: BLE001
+			failures += 1
+			print(f"FAILED: {image_path} ({err})")
+
+	print(f"Done. Success: {successes}, Failed: {failures}")
+
+
+if __name__ == "__main__":
+	run()

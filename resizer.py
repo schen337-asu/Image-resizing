@@ -59,6 +59,20 @@ def parse_yes_no(value: str) -> bool:
 	raise ValueError("Please answer with y/yes or n/no")
 
 
+def parse_enhancement_strength(value: str) -> float:
+	"""Parse and validate enhancement strength in the range 0.0–2.0."""
+	stripped = value.strip()
+	if stripped == "":
+		return 1.0
+	try:
+		strength = float(stripped)
+	except ValueError as exc:
+		raise ValueError("Enhancement strength must be a number, e.g. 0.5 or 1.5") from exc
+	if strength < 0.0 or strength > 2.0:
+		raise ValueError("Enhancement strength must be between 0.0 and 2.0")
+	return strength
+
+
 def apply_s_curve(image: Image.Image, strength: float = 0.18) -> Image.Image:
 	"""Apply a gentle contrast S-curve using a LUT for natural tone shaping."""
 	x = np.linspace(0.0, 1.0, 256)
@@ -74,8 +88,14 @@ def apply_s_curve(image: Image.Image, strength: float = 0.18) -> Image.Image:
 	return image.convert("RGB").point(lut * 3)
 
 
-def enhance_dynamic_range_and_contrast(image: Image.Image) -> Image.Image:
-	"""Enhance luminance detail using CLAHE, then add subtle global contrast and clarity."""
+def enhance_dynamic_range_and_contrast(
+	image: Image.Image, strength: float = 1.0
+) -> Image.Image:
+	"""Enhance luminance detail using CLAHE, then add subtle global contrast and clarity.
+
+	strength scales all enhancement parameters: 1.0 is the default, 0.0 disables
+	per-parameter effects, and 2.0 doubles them.
+	"""
 	rgb = image.convert("RGB")
 	rgb_array = np.array(rgb)
 	bgr = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2BGR)
@@ -83,16 +103,17 @@ def enhance_dynamic_range_and_contrast(image: Image.Image) -> Image.Image:
 	lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
 	l_channel, a_channel, b_channel = cv2.split(lab)
 
-	clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+	clahe = cv2.createCLAHE(clipLimit=2.0 * strength, tileGridSize=(8, 8))
 	enhanced_l = clahe.apply(l_channel)
 	enhanced_lab = cv2.merge((enhanced_l, a_channel, b_channel))
 	enhanced_bgr = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
 	enhanced_rgb = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2RGB)
 
 	enhanced_image = Image.fromarray(enhanced_rgb)
-	enhanced_image = apply_s_curve(enhanced_image, strength=0.16)
+	enhanced_image = apply_s_curve(enhanced_image, strength=0.16 * strength)
+	unsharp_percent = max(1, round(90 * strength))
 	enhanced_image = enhanced_image.filter(
-		ImageFilter.UnsharpMask(radius=1.2, percent=90, threshold=3)
+		ImageFilter.UnsharpMask(radius=1.2, percent=unsharp_percent, threshold=3)
 	)
 	return enhanced_image
 
@@ -102,6 +123,7 @@ def resize_one_jpeg(
 	ratio: float,
 	apply_enhancement: bool,
 	output_directory: Path,
+	enhancement_strength: float = 1.0,
 ) -> Path:
 	"""Resize one JPEG using high-quality LANCZOS and save as JPEG."""
 	with Image.open(image_path) as img:
@@ -109,7 +131,7 @@ def resize_one_jpeg(
 		new_size = resized_dimensions(img.width, img.height, ratio)
 		resized = img.resize(new_size, resample=Image.Resampling.LANCZOS)
 		if apply_enhancement:
-			resized = enhance_dynamic_range_and_contrast(resized)
+			resized = enhance_dynamic_range_and_contrast(resized, strength=enhancement_strength)
 
 		output_name = f"{image_path.stem}_x{ratio_suffix(ratio)}.jpg"
 		output_path = output_directory / output_name
@@ -194,6 +216,16 @@ def run() -> None:
 	except ValueError as err:
 		raise SystemExit(f"Error: {err}") from err
 
+	enhancement_strength = 1.0
+	if apply_enhancement:
+		strength_input = input(
+			"Enhancement strength [0.0–2.0, default 1.0]: "
+		).strip()
+		try:
+			enhancement_strength = parse_enhancement_strength(strength_input)
+		except ValueError as err:
+			raise SystemExit(f"Error: {err}") from err
+
 	images = iter_jpegs(directory)
 	if not images:
 		raise SystemExit("No JPEG files (.jpg/.jpeg) found in the specified directory.")
@@ -202,7 +234,10 @@ def run() -> None:
 	output_directory = directory.parent / f"{original_folder_name}+{ratio_label(ratio)}"
 	output_directory.mkdir(parents=True, exist_ok=True)
 
-	mode = "with enhancement" if apply_enhancement else "without enhancement"
+	if apply_enhancement:
+		mode = f"with enhancement (strength {enhancement_strength})"
+	else:
+		mode = "without enhancement"
 	print(f"Found {len(images)} JPEG file(s). Resizing with ratio {ratio} ({mode})...")
 	print(f"Output directory: {output_directory}")
 	successes = 0
@@ -219,6 +254,7 @@ def run() -> None:
 				ratio,
 				apply_enhancement,
 				target_directory,
+				enhancement_strength,
 			)
 			successes += 1
 			print(f"OK: {image_path} -> {output_path}")

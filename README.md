@@ -63,3 +63,7 @@ becomes:
 ## Detailed Guide
 
 For full instructions and troubleshooting, see `HOW_TO_USE.md`.
+
+## Resizer2 (Real-ESRGAN)
+
+For the Real-ESRGAN-powered version, run `resizer2.py` and see `README_resizer2.md`.
