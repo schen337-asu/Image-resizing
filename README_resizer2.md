@@ -78,9 +78,22 @@ becomes:
 
 Device selection is automatic in this order:
 
-1. CUDA
-2. Apple MPS
+1. CUDA (NVIDIA GPU)
+2. Apple MPS (Apple Silicon / AMD GPU via Metal)
 3. CPU
+
+The selected device is printed at startup, e.g. `[Real-ESRGAN] Using Apple GPU (MPS)`.
+
+**Tiling:** A default tile size of 512 px (`DEFAULT_TILE_SIZE`) is used, splitting large
+images into overlapping tiles before GPU inference. This prevents out-of-memory errors on
+Apple Silicon and keeps throughput stable. Set `tile_size=0` in `RealESRGANEnhancer()` to
+disable tiling (only safe for small images or ample unified memory).
+
+**Half precision (FP16):** Enabled automatically for CUDA. Kept at FP32 for MPS because
+PyTorch MPS FP16 can produce NaN values in certain Real-ESRGAN operations.
+
+**Parallel processing:** When enhancement is disabled, images are resized in parallel
+using a thread pool (up to 8 workers) for faster CPU-bound throughput.
 
 First run may be slower because model files are downloaded and cached.
 
@@ -102,9 +115,11 @@ use `resizer2.py` directly (it includes a compatibility shim) and make sure
 
 ### Slow processing
 
-- Use enhancement only when needed
-- Keep blend strength lower for lighter effect
-- Ensure you are running in an accelerated environment (CUDA/MPS if available)
+- Check startup output — it should say `Using Apple GPU (MPS)` or `Using NVIDIA GPU (CUDA)`
+- If it says `Using CPU`, your PyTorch build may not have MPS support (`torch.backends.mps.is_available()` returns False)
+- Use enhancement only when needed; lower blend strength reduces the ESRGAN contribution
+- For very large images, the default `tile_size=512` keeps GPU memory usage bounded
+- Non-enhanced resizes run in parallel automatically (thread pool)
 
 ### No files processed
 

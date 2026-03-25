@@ -12,6 +12,7 @@ and saves output files in the alternate sibling directory named
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import subprocess
 import sys
@@ -26,6 +27,9 @@ DEFAULT_REALESRGAN_MODEL_URL = (
 	"https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/"
 	"RealESRGAN_x4plus.pth"
 )
+
+# Default tile size for GPU inference (0 = disabled, 512 recommended for MPS/CUDA)
+DEFAULT_TILE_SIZE = 512
 
 
 def parse_ratio_text(value: str) -> float:
@@ -141,7 +145,21 @@ class RealESRGANEnhancer:
 			compat_module.rgb_to_grayscale = tv_functional.rgb_to_grayscale
 		sys.modules[module_name] = compat_module
 
-	def __init__(self, model_url: str = DEFAULT_REALESRGAN_MODEL_URL) -> None:
+	@staticmethod
+	def _select_device(torch_module) -> "torch.device":
+		"""Return the best available device: CUDA > MPS > CPU."""
+		if torch_module.cuda.is_available():
+			device = torch_module.device("cuda")
+			print("[Real-ESRGAN] Using NVIDIA GPU (CUDA)")
+		elif torch_module.backends.mps.is_available():
+			device = torch_module.device("mps")
+			print("[Real-ESRGAN] Using Apple GPU (MPS)")
+		else:
+			device = torch_module.device("cpu")
+			print("[Real-ESRGAN] Using CPU (no GPU detected)")
+		return device
+
+	def __init__(self, model_url: str = DEFAULT_REALESRGAN_MODEL_URL, tile_size: int = DEFAULT_TILE_SIZE) -> None:
 		self._ensure_torchvision_compat()
 		try:
 			import torch
@@ -155,6 +173,9 @@ class RealESRGANEnhancer:
 
 		self._torch = torch
 		self._model_scale = 4
+		device = self._select_device(torch)
+		# FP16 is stable on CUDA; MPS FP16 can produce NaN values — keep FP32 on MPS/CPU
+		use_half = torch.cuda.is_available()
 		self._rrdb_model = RRDBNet(
 			num_in_ch=3,
 			num_out_ch=3,
@@ -167,10 +188,11 @@ class RealESRGANEnhancer:
 			scale=self._model_scale,
 			model_path=model_url,
 			model=self._rrdb_model,
-			tile=0,
+			tile=tile_size,
 			tile_pad=10,
 			pre_pad=0,
-			half=self._torch.cuda.is_available(),
+			half=use_half,
+			device=device,
 		)
 
 	def enhance(self, image: Image.Image, ratio: float, blend_strength: float) -> Image.Image:
@@ -287,25 +309,44 @@ def run() -> None:
 	successes = 0
 	failures = 0
 
-	for image_path in images:
-		try:
+	if apply_enhancement:
+		# GPU inference must be sequential; parallelise only disk I/O around it
+		for image_path in images:
+			try:
+				relative_parent = image_path.relative_to(directory).parent
+				target_directory = output_directory / relative_parent
+				target_directory.mkdir(parents=True, exist_ok=True)
+				output_path = resize_one_jpeg(
+					image_path, ratio, True, target_directory, enhancer, blend_strength
+				)
+				successes += 1
+				print(f"OK: {image_path} -> {output_path}")
+			except Exception as err:  # noqa: BLE001
+				failures += 1
+				print(f"FAILED: {image_path} ({err})")
+	else:
+		# No GPU involved: parallelise across CPU cores for pure resize workload
+		workers = min(8, (len(images) or 1))
+
+		def _process_one(image_path: Path) -> Path:
 			relative_parent = image_path.relative_to(directory).parent
 			target_directory = output_directory / relative_parent
 			target_directory.mkdir(parents=True, exist_ok=True)
-
-			output_path = resize_one_jpeg(
-				image_path,
-				ratio,
-				apply_enhancement,
-				target_directory,
-				enhancer,
-				blend_strength,
+			return resize_one_jpeg(
+				image_path, ratio, False, target_directory, None, blend_strength
 			)
-			successes += 1
-			print(f"OK: {image_path} -> {output_path}")
-		except Exception as err:  # noqa: BLE001
-			failures += 1
-			print(f"FAILED: {image_path} ({err})")
+
+		with ThreadPoolExecutor(max_workers=workers) as pool:
+			future_to_path = {pool.submit(_process_one, p): p for p in images}
+			for future in as_completed(future_to_path):
+				image_path = future_to_path[future]
+				try:
+					output_path = future.result()
+					successes += 1
+					print(f"OK: {image_path} -> {output_path}")
+				except Exception as err:  # noqa: BLE001
+					failures += 1
+					print(f"FAILED: {image_path} ({err})")
 
 	print(f"Done. Success: {successes}, Failed: {failures}")
 
