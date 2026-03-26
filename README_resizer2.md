@@ -18,7 +18,9 @@ Output folder format:
 
 ## Requirements
 
-- Python 3.12+ recommended
+- Supported Python: 3.10–3.12
+- Recommended Python: 3.12.x
+- Python 3.13+ is not recommended yet (PyTorch/torchvision compatibility may vary)
 - Dependencies from `requirements.txt`
 
 Key model dependencies:

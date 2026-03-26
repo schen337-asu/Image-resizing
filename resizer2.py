@@ -166,10 +166,16 @@ class RealESRGANEnhancer:
 			from basicsr.archs.rrdbnet_arch import RRDBNet
 			from realesrgan import RealESRGANer
 		except ImportError as exc:
-			raise RuntimeError(
-				"Missing required packages for Real-ESRGAN enhancement. "
-				"Install with: pip install torch realesrgan basicsr"
-			) from exc
+			message = (
+				"Missing or incompatible dependencies for Real-ESRGAN enhancement. "
+				f"Underlying import error: {exc}. "
+				f"Active interpreter: {sys.executable}. "
+				"Install/repair with: pip install -r requirements.txt. "
+				"If the error mentions 'torchvision.transforms.functional_tensor', "
+				"run this script directly and keep torchvision pinned to the version "
+				"range in requirements.txt."
+			)
+			raise RuntimeError(message) from exc
 
 		self._torch = torch
 		self._model_scale = 4
