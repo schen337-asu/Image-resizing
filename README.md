@@ -19,7 +19,9 @@ High-quality JPEG batch resizer with optional dynamic range and contrast enhance
 
 ## Requirements
 
-- Python 3.13+ recommended
+- Supported Python: 3.10–3.12
+- Recommended Python: 3.12.x
+- Python 3.13+ is not recommended yet (PyTorch/torchvision compatibility may vary)
 - Dependencies in `requirements.txt`
 
 ## Quick Start
