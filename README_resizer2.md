@@ -10,9 +10,7 @@
 - Preserves relative folder structure in output
 - Preserves EXIF/ICC metadata when available
 
-Output folder format:
-
-`<original folder name>+<multiplier>`
+The selected destination folder is used as the output root.
 
 ---
 
@@ -49,7 +47,7 @@ python resizer2.py
 
 The script will prompt for:
 
-1. Input folder (via macOS folder picker; fallback to typed path)
+1. Source and destination folders in one Tkinter dialog (fallback to typed paths if Tk is unavailable)
 2. Resize multiplier (examples: `0.5`, `1.25`, `2`)
 3. Whether to apply Real-ESRGAN enhancement (`Y/n`)
 4. Real-ESRGAN blend strength (`0.0` to `1.0`, default `0.6`) if enhancement is enabled
@@ -58,9 +56,9 @@ The script will prompt for:
 
 ## Example
 
-- Input folder: `/Users/name/Pictures/Holidays`
+- Source folder: `/Users/name/Pictures/Holidays`
+- Destination folder: `/Users/name/Pictures/Holidays-resized`
 - Multiplier: `0.5`
-- Output folder: `/Users/name/Pictures/Holidays+0.5`
 
 A file:
 
@@ -68,7 +66,7 @@ A file:
 
 becomes:
 
-`/Users/name/Pictures/Holidays+0.5/Trips/Italy/img001_x0p5.jpg`
+`/Users/name/Pictures/Holidays-resized/Trips/Italy/img001_x0p5.jpg`
 
 ---
 

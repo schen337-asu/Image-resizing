@@ -1,21 +1,22 @@
 """Batch resize JPEG images and optionally enhance with Real-ESRGAN.
 
 The script prompts for:
-1) A directory selected from a folder picker UI
+1) Source and destination directories selected from one Tkinter dialog
 2) A positive multiplier ratio (for example: 0.5, 1.25, 2)
 3) Whether to apply Real-ESRGAN enhancement and blend strength
 
-It resizes every .jpg/.jpeg image in that directory (including child folders)
-and saves output files in the alternate sibling directory named
-<original folder name>+<multiplier>, preserving relative subfolder structure.
+It resizes every .jpg/.jpeg image in the source directory (including child
+folders) and saves output files in the selected destination directory while
+preserving relative subfolder structure.
 """
 
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-import subprocess
 import sys
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
 import types
 
 import cv2
@@ -50,11 +51,6 @@ def ratio_suffix(ratio: float) -> str:
 	return ratio_str.replace(".", "p")
 
 
-def ratio_label(ratio: float) -> str:
-	"""Create a readable multiplier label for directory naming."""
-	return f"{ratio:.4f}".rstrip("0").rstrip(".")
-
-
 def resized_dimensions(width: int, height: int, ratio: float) -> tuple[int, int]:
 	"""Return clamped target dimensions based on the ratio."""
 	new_width = max(1, round(width * ratio))
@@ -86,35 +82,108 @@ def parse_blend_strength(value: str) -> float:
 	return strength
 
 
-def pick_directory() -> Path:
-	"""Open a folder picker UI and return the selected directory path.
+def pick_directories() -> tuple[Path, Path]:
+	"""Open one Tkinter dialog to choose both source and destination directories."""
+	root: tk.Tk | None = None
+	selection: dict[str, str] = {}
 
-	Uses native macOS chooser via osascript and falls back to manual input.
-	"""
-	selected = ""
+	def fallback_prompt() -> tuple[Path, Path]:
+		source = input("Tkinter dialog unavailable. Enter source directory path: ").strip()
+		destination = input("Tkinter dialog unavailable. Enter destination directory path: ").strip()
+		if not source or not destination:
+			raise SystemExit("No directory selected.")
+		return Path(source).expanduser().resolve(), Path(destination).expanduser().resolve()
+
 	try:
-		result = subprocess.run(
-			[
-				"osascript",
-				"-e",
-				'POSIX path of (choose folder with prompt "Select folder containing JPEG images")',
-			],
-			capture_output=True,
-			text=True,
-			check=False,
-		)
-		if result.returncode == 0:
-			selected = result.stdout.strip()
-	except FileNotFoundError:
-		selected = ""
+		root = tk.Tk()
+		root.title("Choose source and destination folders")
+		root.resizable(False, False)
+		root.attributes("-topmost", True)
 
-	if not selected:
-		selected = input("Folder picker cancelled/unavailable. Enter directory path: ").strip()
+		source_var = tk.StringVar()
+		destination_var = tk.StringVar()
 
-	if not selected:
+		frame = ttk.Frame(root, padding=16)
+		frame.grid(row=0, column=0, sticky="nsew")
+
+		def browse_for_directory(target: tk.StringVar, dialog_title: str) -> None:
+			selected = filedialog.askdirectory(
+				parent=root,
+				title=dialog_title,
+				mustexist=True,
+				initialdir=target.get() or str(Path.home()),
+			)
+			if selected:
+				target.set(selected)
+
+		def submit() -> None:
+			source_value = source_var.get().strip()
+			destination_value = destination_var.get().strip()
+			if not source_value or not destination_value:
+				messagebox.showerror(
+					"Missing folder",
+					"Select both source and destination folders before continuing.",
+					parent=root,
+				)
+				return
+			selection["source"] = source_value
+			selection["destination"] = destination_value
+			root.quit()
+
+		def cancel() -> None:
+			root.quit()
+
+		ttk.Label(frame, text="Source folder").grid(row=0, column=0, sticky="w", pady=(0, 6))
+		ttk.Entry(frame, textvariable=source_var, width=54).grid(row=1, column=0, padx=(0, 8), sticky="ew")
+		ttk.Button(
+			frame,
+			text="Browse...",
+			command=lambda: browse_for_directory(source_var, "Select source folder containing JPEG images"),
+		).grid(row=1, column=1, sticky="ew")
+
+		ttk.Label(frame, text="Destination folder").grid(row=2, column=0, sticky="w", pady=(14, 6))
+		ttk.Entry(frame, textvariable=destination_var, width=54).grid(row=3, column=0, padx=(0, 8), sticky="ew")
+		ttk.Button(
+			frame,
+			text="Browse...",
+			command=lambda: browse_for_directory(destination_var, "Select destination folder for resized JPEG images"),
+		).grid(row=3, column=1, sticky="ew")
+
+		button_row = ttk.Frame(frame)
+		button_row.grid(row=4, column=0, columnspan=2, sticky="e", pady=(16, 0))
+		ttk.Button(button_row, text="Cancel", command=cancel).grid(row=0, column=0, padx=(0, 8))
+		ttk.Button(button_row, text="Continue", command=submit).grid(row=0, column=1)
+
+		root.columnconfigure(0, weight=1)
+		frame.columnconfigure(0, weight=1)
+		root.protocol("WM_DELETE_WINDOW", cancel)
+		root.bind("<Return>", lambda _event: submit())
+		root.bind("<Escape>", lambda _event: cancel())
+		root.mainloop()
+	except tk.TclError:
+		return fallback_prompt()
+	finally:
+		if root is not None:
+			root.destroy()
+
+	if not selection:
 		raise SystemExit("No directory selected.")
 
-	return Path(selected).expanduser().resolve()
+	return (
+		Path(selection["source"]).expanduser().resolve(),
+		Path(selection["destination"]).expanduser().resolve(),
+	)
+
+
+def validate_destination_directory(source_directory: Path, destination_directory: Path) -> None:
+	"""Reject unsafe destination choices that would mix output into the source tree."""
+	if destination_directory == source_directory:
+		raise SystemExit("Error: Source and destination directories must be different.")
+	if destination_directory.is_relative_to(source_directory):
+		raise SystemExit(
+			"Error: Destination directory cannot be inside the source directory. "
+			"Choose a separate output folder."
+		)
 
 
 def iter_jpegs(directory: Path) -> list[Path]:
@@ -146,7 +215,7 @@ class RealESRGANEnhancer:
 		sys.modules[module_name] = compat_module
 
 	@staticmethod
-	def _select_device(torch_module) -> "torch.device":
+	def _select_device(torch_module):
 		"""Return the best available device: CUDA > MPS > CPU."""
 		if torch_module.cuda.is_available():
 			device = torch_module.device("cuda")
@@ -266,12 +335,15 @@ def resize_one_jpeg(
 
 def run() -> None:
 	"""Prompt user for inputs and process JPEG files in the selected directory."""
-	directory = pick_directory()
+	directory, output_directory = pick_directories()
 	ratio_input = input("Enter the multiplier ratio (e.g. 0.5, 1.25, 2): ").strip()
 	enhance_input = input("Apply Real-ESRGAN enhancement? [Y/n] (recommended): ").strip()
 
 	if not directory.exists() or not directory.is_dir():
 		raise SystemExit(f"Error: '{directory}' is not a valid directory.")
+	if not output_directory.exists() or not output_directory.is_dir():
+		raise SystemExit(f"Error: '{output_directory}' is not a valid directory.")
+	validate_destination_directory(directory, output_directory)
 
 	try:
 		ratio = parse_ratio_text(ratio_input)
@@ -302,8 +374,6 @@ def run() -> None:
 		except RuntimeError as err:
 			raise SystemExit(f"Error: {err}") from err
 
-	original_folder_name = directory.name or "root"
-	output_directory = directory.parent / f"{original_folder_name}+{ratio_label(ratio)}"
 	output_directory.mkdir(parents=True, exist_ok=True)
 
 	if apply_enhancement:
@@ -311,6 +381,7 @@ def run() -> None:
 	else:
 		mode = "without enhancement"
 	print(f"Found {len(images)} JPEG file(s). Resizing with ratio {ratio} ({mode})...")
+	print(f"Source directory: {directory}")
 	print(f"Output directory: {output_directory}")
 	successes = 0
 	failures = 0
