@@ -68,4 +68,38 @@ For full instructions and troubleshooting, see `HOW_TO_USE.md`.
 
 ## Resizer2 (Real-ESRGAN)
 
+`resizer2.py` is currently tracked as sub-version `v2.1`.
+
+Recent `v2.1` changes:
+
+- One Tkinter settings dialog for source, destination, resize ratio, model selection, blend strength, and tile size.
+- Optional tile benchmark mode to test one image with multiple tile sizes before the full batch starts.
+- Overall progress window replaces per-file terminal progress logs.
+- Existing output files with matching names are skipped instead of being overwritten.
+- Real-ESRGAN settings now support model choice, tile-size tuning, and benchmark-assisted tile selection.
+
 For the Real-ESRGAN-powered version, run `resizer2.py` and see `README_resizer2.md`.
+
+## Resizer3 (MLX + Apple Quantization)
+
+`resizer3.py` is currently tracked as sub-version `v3.1`.
+
+`resizer3.py` is the Apple-focused variant that uses MLX for enhancement and
+adds optional low-bit quantization controls for faster processing on Apple Silicon.
+
+Key `v3.1` capabilities:
+
+- One Tkinter settings dialog for source, destination, ratio, enhancement toggle, blend strength, and quantization mode.
+- MLX-based enhancement pipeline with quantization options: `off`, `8-bit`, `4-bit`.
+- Overall progress window with live status/counters and a `Cancel` button to stop jobs mid-run.
+- Existing output files with matching names are skipped instead of overwritten.
+
+Run:
+
+```bash
+python resizer3.py
+```
+
+Dependency note:
+
+- `resizer3.py` requires `mlx` (included in `requirements.txt`).

@@ -1,5 +1,7 @@
 """Batch resize JPEG images and optionally enhance with Real-ESRGAN.
 
+Resizer2 sub-version: v2.1
+
 All processing settings are collected from one Tkinter dialog:
 - Source and destination directories
 - Resize multiplier ratio
@@ -17,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import types
@@ -33,6 +36,7 @@ DEFAULT_REALESRGAN_MODEL_URL = (
 
 # Default tile size for GPU inference (0 = disabled, 512 recommended for MPS/CUDA)
 DEFAULT_TILE_SIZE = 512
+RESIZER2_SUBVERSION = "v2.1"
 
 
 @dataclass
@@ -43,10 +47,14 @@ class Settings:
 	destination: Path
 	ratio: float
 	apply_enhancement: bool
+	tile_size: int
 	blend_strength: float
 	model_url: str
 	model_scale: int
 	model_num_block: int
+	run_benchmark: bool
+	benchmark_image: Path | None
+	benchmark_tile_sizes: tuple[int, ...]
 
 
 REALESRGAN_MODELS: dict[str, tuple[str, int, int]] = {
@@ -117,6 +125,31 @@ def parse_blend_strength(value: str) -> float:
 	return strength
 
 
+def parse_tile_size_text(value: str) -> int:
+	"""Parse and validate a Real-ESRGAN tile size.
+
+	A tile size of 0 disables tiling. Positive values enable tiled inference.
+	"""
+	stripped = value.strip()
+	if stripped == "":
+		return DEFAULT_TILE_SIZE
+	try:
+		tile_size = int(stripped)
+	except ValueError as exc:
+		raise ValueError("Tile size must be an integer, e.g. 0, 256, 512") from exc
+	if tile_size < 0:
+		raise ValueError("Tile size must be 0 or a positive integer")
+	return tile_size
+
+
+def parse_tile_sizes_text(value: str) -> tuple[int, ...]:
+	"""Parse a comma-separated list of benchmark tile sizes."""
+	parts = [part.strip() for part in value.split(",") if part.strip()]
+	if not parts:
+		raise ValueError("Benchmark tile sizes must include at least one integer value")
+	return tuple(parse_tile_size_text(part) for part in parts)
+
+
 def show_settings_dialog() -> Settings:
 	"""Open a single Tkinter dialog to collect all processing settings."""
 	root: tk.Tk | None = None
@@ -139,7 +172,11 @@ def show_settings_dialog() -> Settings:
 			raise SystemExit(f"Error: {err}") from err
 		model_names = list(REALESRGAN_MODELS)
 		model_url, model_scale, model_num_block = REALESRGAN_MODELS[model_names[0]]
+		tile_size = DEFAULT_TILE_SIZE
 		blend_strength = 0.6
+		run_benchmark = False
+		benchmark_image: Path | None = None
+		benchmark_tile_sizes = (256, 384, 512, 640, 768)
 		if apply_enhancement:
 			for i, name in enumerate(model_names):
 				print(f"  {i + 1}. {name}")
@@ -151,25 +188,49 @@ def show_settings_dialog() -> Settings:
 			except ValueError:
 				idx = 0
 			model_url, model_scale, model_num_block = REALESRGAN_MODELS[model_names[idx]]
+			tile_text = input(f"Tile size [0 or positive integer, default {DEFAULT_TILE_SIZE}]: ").strip()
+			try:
+				tile_size = parse_tile_size_text(tile_text)
+			except ValueError as err:
+				raise SystemExit(f"Error: {err}") from err
 			strength_text = input("Blend strength [0.0\u20131.0, default 0.6]: ").strip()
 			try:
 				blend_strength = parse_blend_strength(strength_text)
 			except ValueError as err:
 				raise SystemExit(f"Error: {err}") from err
+			benchmark_text = input("Run tile benchmark on one image first? [y/N]: ").strip()
+			try:
+				run_benchmark = benchmark_text.strip().lower() in {"y", "yes"}
+			except ValueError as err:
+				raise SystemExit(f"Error: {err}") from err
+			if run_benchmark:
+				image_text = input("Benchmark image path [leave blank to use first JPEG in source]: ").strip()
+				if image_text:
+					benchmark_image = Path(image_text).expanduser().resolve()
+				tiles_text = input("Benchmark tile sizes [comma-separated, default 256,384,512,640,768]: ").strip()
+				if tiles_text:
+					try:
+						benchmark_tile_sizes = parse_tile_sizes_text(tiles_text)
+					except ValueError as err:
+						raise SystemExit(f"Error: {err}") from err
 		return Settings(
 			source=Path(source).expanduser().resolve(),
 			destination=Path(destination).expanduser().resolve(),
 			ratio=ratio,
 			apply_enhancement=apply_enhancement,
+			tile_size=tile_size,
 			blend_strength=blend_strength,
 			model_url=model_url,
 			model_scale=model_scale,
 			model_num_block=model_num_block,
+			run_benchmark=run_benchmark,
+			benchmark_image=benchmark_image,
+			benchmark_tile_sizes=benchmark_tile_sizes,
 		)
 
 	try:
 		root = tk.Tk()
-		root.title("Image Resizer Settings")
+		root.title(f"Image Resizer Settings {RESIZER2_SUBVERSION}")
 		root.resizable(False, False)
 		root.attributes("-topmost", True)
 
@@ -179,7 +240,11 @@ def show_settings_dialog() -> Settings:
 		enhance_var = tk.BooleanVar(value=True)
 		model_names = list(REALESRGAN_MODELS)
 		model_var = tk.StringVar(value=model_names[0])
+		tile_size_var = tk.StringVar(value=str(DEFAULT_TILE_SIZE))
 		blend_var = tk.DoubleVar(value=0.6)
+		run_benchmark_var = tk.BooleanVar(value=False)
+		benchmark_image_var = tk.StringVar()
+		benchmark_tile_sizes_var = tk.StringVar(value="256,384,512,640,768")
 
 		outer = ttk.Frame(root, padding=16)
 		outer.grid(row=0, column=0, sticky="nsew")
@@ -191,6 +256,16 @@ def show_settings_dialog() -> Settings:
 				title=dialog_title,
 				mustexist=True,
 				initialdir=target.get() or str(Path.home()),
+			)
+			if selected:
+				target.set(selected)
+
+		def browse_for_image(target: tk.StringVar) -> None:
+			selected = filedialog.askopenfilename(
+				parent=root,
+				title="Select benchmark image",
+				initialdir=source_var.get() or str(Path.home()),
+				filetypes=[("JPEG images", "*.jpg *.jpeg"), ("All files", "*.*")],
 			)
 			if selected:
 				target.set(selected)
@@ -232,15 +307,27 @@ def show_settings_dialog() -> Settings:
 
 		# Define _toggle_enhancement before the Checkbutton so the command ref is valid.
 		# model_combo and blend_scale are captured by late-binding closure (created below).
+		def _toggle_benchmark() -> None:
+			benchmark_enabled = enhance_var.get() and run_benchmark_var.get()
+			benchmark_image_entry.configure(state="normal" if benchmark_enabled else "disabled")
+			benchmark_image_button.configure(state="normal" if benchmark_enabled else "disabled")
+			benchmark_tiles_entry.configure(state="normal" if benchmark_enabled else "disabled")
+
 		def _toggle_enhancement() -> None:
 			if enhance_var.get():
 				model_combo.configure(state="readonly")
+				tile_size_entry.configure(state="normal")
 				blend_scale.configure(state="normal")
 				blend_label.configure(foreground="")
+				run_benchmark_checkbox.configure(state="normal")
 			else:
 				model_combo.configure(state="disabled")
+				tile_size_entry.configure(state="disabled")
 				blend_scale.configure(state="disabled")
 				blend_label.configure(foreground="gray")
+				run_benchmark_checkbox.configure(state="disabled")
+				run_benchmark_var.set(False)
+			_toggle_benchmark()
 
 		ttk.Checkbutton(
 			enh_frame,
@@ -259,9 +346,13 @@ def show_settings_dialog() -> Settings:
 		)
 		model_combo.grid(row=1, column=1, sticky="ew", pady=(0, 4))
 
-		ttk.Label(enh_frame, text="Blend strength:").grid(row=2, column=0, sticky="w", pady=(8, 0))
+		ttk.Label(enh_frame, text="Tile size:").grid(row=2, column=0, sticky="w", pady=(4, 0))
+		tile_size_entry = ttk.Entry(enh_frame, textvariable=tile_size_var, width=12)
+		tile_size_entry.grid(row=2, column=1, sticky="w", pady=(4, 0))
+
+		ttk.Label(enh_frame, text="Blend strength:").grid(row=3, column=0, sticky="w", pady=(8, 0))
 		blend_row = ttk.Frame(enh_frame)
-		blend_row.grid(row=2, column=1, sticky="ew", pady=(8, 0))
+		blend_row.grid(row=3, column=1, sticky="ew", pady=(8, 0))
 		blend_scale = tk.Scale(
 			blend_row,
 			variable=blend_var,
@@ -281,6 +372,31 @@ def show_settings_dialog() -> Settings:
 
 		blend_var.trace_add("write", _update_blend_label)
 
+		run_benchmark_checkbox = ttk.Checkbutton(
+			enh_frame,
+			text="Run tile benchmark on one image before processing",
+			variable=run_benchmark_var,
+			command=_toggle_benchmark,
+		)
+		run_benchmark_checkbox.grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 4))
+
+		ttk.Label(enh_frame, text="Benchmark image:").grid(row=5, column=0, sticky="w", pady=(0, 4))
+		benchmark_image_row = ttk.Frame(enh_frame)
+		benchmark_image_row.grid(row=5, column=1, sticky="ew", pady=(0, 4))
+		benchmark_image_row.columnconfigure(0, weight=1)
+		benchmark_image_entry = ttk.Entry(benchmark_image_row, textvariable=benchmark_image_var, width=42)
+		benchmark_image_entry.grid(row=0, column=0, padx=(0, 8), sticky="ew")
+		benchmark_image_button = ttk.Button(
+			benchmark_image_row,
+			text="Browse...",
+			command=lambda: browse_for_image(benchmark_image_var),
+		)
+		benchmark_image_button.grid(row=0, column=1)
+
+		ttk.Label(enh_frame, text="Benchmark tile sizes:").grid(row=6, column=0, sticky="w", pady=(0, 4))
+		benchmark_tiles_entry = ttk.Entry(enh_frame, textvariable=benchmark_tile_sizes_var, width=32)
+		benchmark_tiles_entry.grid(row=6, column=1, sticky="w", pady=(0, 4))
+
 		# ── Buttons ───────────────────────────────────────────────────────
 		def submit() -> None:
 			nonlocal result
@@ -298,16 +414,36 @@ def show_settings_dialog() -> Settings:
 			except ValueError as err:
 				messagebox.showerror("Invalid ratio", str(err), parent=root)
 				return
+			try:
+				tile_size = parse_tile_size_text(tile_size_var.get())
+			except ValueError as err:
+				messagebox.showerror("Invalid tile size", str(err), parent=root)
+				return
+			benchmark_image: Path | None = None
+			benchmark_tile_sizes: tuple[int, ...] = (256, 384, 512, 640, 768)
+			if enhance_var.get() and run_benchmark_var.get():
+				benchmark_image_value = benchmark_image_var.get().strip()
+				if benchmark_image_value:
+					benchmark_image = Path(benchmark_image_value).expanduser().resolve()
+				try:
+					benchmark_tile_sizes = parse_tile_sizes_text(benchmark_tile_sizes_var.get())
+				except ValueError as err:
+					messagebox.showerror("Invalid benchmark tile sizes", str(err), parent=root)
+					return
 			model_url, model_scale, model_num_block = REALESRGAN_MODELS[model_var.get()]
 			result = Settings(
 				source=Path(source_value).expanduser().resolve(),
 				destination=Path(destination_value).expanduser().resolve(),
 				ratio=ratio,
 				apply_enhancement=enhance_var.get(),
+				tile_size=tile_size,
 				blend_strength=round(blend_var.get(), 2),
 				model_url=model_url,
 				model_scale=model_scale,
 				model_num_block=model_num_block,
+				run_benchmark=enhance_var.get() and run_benchmark_var.get(),
+				benchmark_image=benchmark_image,
+				benchmark_tile_sizes=benchmark_tile_sizes,
 			)
 			root.withdraw()
 			root.quit()
@@ -326,6 +462,7 @@ def show_settings_dialog() -> Settings:
 		root.bind("<Return>", lambda _event: submit())
 		root.bind("<Escape>", lambda _event: cancel())
 		_toggle_enhancement()
+		_toggle_benchmark()
 		root.mainloop()
 	except tk.TclError:
 		return fallback_prompt()
@@ -379,17 +516,20 @@ class RealESRGANEnhancer:
 		sys.modules[module_name] = compat_module
 
 	@staticmethod
-	def _select_device(torch_module):
+	def _select_device(torch_module, verbose: bool = True):
 		"""Return the best available device: CUDA > MPS > CPU."""
 		if torch_module.cuda.is_available():
 			device = torch_module.device("cuda")
-			print("[Real-ESRGAN] Using NVIDIA GPU (CUDA)")
+			if verbose:
+				print("[Real-ESRGAN] Using NVIDIA GPU (CUDA)")
 		elif torch_module.backends.mps.is_available():
 			device = torch_module.device("mps")
-			print("[Real-ESRGAN] Using Apple GPU (MPS)")
+			if verbose:
+				print("[Real-ESRGAN] Using Apple GPU (MPS)")
 		else:
 			device = torch_module.device("cpu")
-			print("[Real-ESRGAN] Using CPU (no GPU detected)")
+			if verbose:
+				print("[Real-ESRGAN] Using CPU (no GPU detected)")
 		return device
 
 	def __init__(
@@ -398,6 +538,7 @@ class RealESRGANEnhancer:
 		tile_size: int = DEFAULT_TILE_SIZE,
 		model_scale: int = 4,
 		num_block: int = 23,
+		verbose: bool = False,
 	) -> None:
 		self._ensure_torchvision_compat()
 		try:
@@ -418,7 +559,7 @@ class RealESRGANEnhancer:
 
 		self._torch = torch
 		self._model_scale = model_scale
-		device = self._select_device(torch)
+		device = self._select_device(torch, verbose=verbose)
 		# FP16 is stable on CUDA; MPS FP16 can produce NaN values — keep FP32 on MPS/CPU
 		use_half = torch.cuda.is_available()
 		self._rrdb_model = RRDBNet(
@@ -616,6 +757,113 @@ def show_progress_dialog(
 		print(f"\nDone \u2014 {counts['ok']} succeeded, {counts['skipped']} skipped, {counts['failed']} failed.")
 
 
+def run_tile_benchmark_dialog(
+	benchmark_image: Path,
+	settings: Settings,
+	benchmark_tile_sizes: tuple[int, ...],
+) -> int:
+	"""Benchmark candidate tile sizes on one image and optionally adopt the fastest."""
+	results: list[tuple[int, float]] = []
+	failure_message: str | None = None
+
+	def _benchmark_once(tile_size: int) -> float:
+		start_time = time.perf_counter()
+		enhancer = RealESRGANEnhancer(
+			model_url=settings.model_url,
+			tile_size=tile_size,
+			model_scale=settings.model_scale,
+			num_block=settings.model_num_block,
+			verbose=False,
+		)
+		with Image.open(benchmark_image) as img:
+			img = ImageOps.exif_transpose(img)
+			enhancer.enhance(img, settings.ratio, settings.blend_strength)
+		return time.perf_counter() - start_time
+
+	try:
+		root = tk.Tk()
+		root.title("Benchmarking Tile Sizes\u2026")
+		root.resizable(False, False)
+		root.attributes("-topmost", True)
+
+		outer = ttk.Frame(root, padding=16)
+		outer.grid(row=0, column=0, sticky="nsew")
+		outer.columnconfigure(0, weight=1)
+
+		status_var = tk.StringVar(value=f"Benchmark image: {benchmark_image.name}")
+		ttk.Label(outer, textvariable=status_var, anchor="w", width=64).grid(
+			row=0, column=0, sticky="ew", pady=(0, 8)
+		)
+
+		progress_var = tk.IntVar(value=0)
+		ttk.Progressbar(
+			outer,
+			variable=progress_var,
+			maximum=len(benchmark_tile_sizes),
+			length=500,
+			mode="determinate",
+		).grid(row=1, column=0, sticky="ew", pady=(0, 10))
+
+		results_var = tk.StringVar(value="Pending benchmark results...")
+		ttk.Label(outer, textvariable=results_var, justify="left", anchor="w").grid(
+			row=2, column=0, sticky="w", pady=(0, 14)
+		)
+
+		close_btn = ttk.Button(outer, text="Close", command=root.destroy, state="disabled")
+		close_btn.grid(row=3, column=0, sticky="e")
+
+		root.protocol("WM_DELETE_WINDOW", lambda: None)
+
+		def _update(done: int, tile_size: int, elapsed: float) -> None:
+			progress_var.set(done)
+			status_var.set(f"[{done}/{len(benchmark_tile_sizes)}] Tile {tile_size}: {elapsed:.2f}s")
+			results_var.set("\n".join(f"Tile {size}: {seconds:.2f}s" for size, seconds in results))
+
+		def _finish() -> None:
+			if failure_message is not None:
+				status_var.set(f"Benchmark failed: {failure_message}")
+				results_var.set("No benchmark result available.")
+			else:
+				best_tile_size, best_elapsed = min(results, key=lambda item: item[1])
+				status_var.set(f"Fastest tile size: {best_tile_size} ({best_elapsed:.2f}s)")
+			root.title("Tile Benchmark Complete")
+			root.protocol("WM_DELETE_WINDOW", root.destroy)
+			close_btn.configure(state="normal")
+
+		def _worker() -> None:
+			nonlocal failure_message
+			for i, tile_size in enumerate(benchmark_tile_sizes, 1):
+				try:
+					elapsed = _benchmark_once(tile_size)
+					results.append((tile_size, elapsed))
+					root.after(0, _update, i, tile_size, elapsed)
+				except Exception as err:  # noqa: BLE001
+					failure_message = str(err)
+					break
+			root.after(0, _finish)
+
+		threading.Thread(target=_worker, daemon=True).start()
+		root.mainloop()
+	except tk.TclError:
+		for tile_size in benchmark_tile_sizes:
+			elapsed = _benchmark_once(tile_size)
+			results.append((tile_size, elapsed))
+			print(f"Tile {tile_size}: {elapsed:.2f}s")
+
+	if failure_message is not None:
+		raise SystemExit(f"Benchmark failed: {failure_message}")
+	if not results:
+		return settings.tile_size
+
+	best_tile_size, best_elapsed = min(results, key=lambda item: item[1])
+	if messagebox.askyesno(
+		"Use fastest tile size?",
+		f"Fastest tile size was {best_tile_size} ({best_elapsed:.2f}s).\n\nUse it for this batch?",
+	):
+		return best_tile_size
+	return settings.tile_size
+
+
 def run() -> None:
 	"""Collect settings from the dialog and process JPEG files."""
 	settings = show_settings_dialog()
@@ -624,6 +872,7 @@ def run() -> None:
 	ratio = settings.ratio
 	apply_enhancement = settings.apply_enhancement
 	blend_strength = settings.blend_strength
+	tile_size = settings.tile_size
 
 	if not directory.exists() or not directory.is_dir():
 		raise SystemExit(f"Error: '{directory}' is not a valid directory.")
@@ -635,11 +884,22 @@ def run() -> None:
 	if not images:
 		raise SystemExit("No JPEG files (.jpg/.jpeg) found in the specified directory.")
 
+	if apply_enhancement and settings.run_benchmark:
+		benchmark_image = settings.benchmark_image or images[0]
+		if not benchmark_image.exists() or not benchmark_image.is_file():
+			raise SystemExit(f"Error: Benchmark image '{benchmark_image}' does not exist.")
+		tile_size = run_tile_benchmark_dialog(
+			benchmark_image,
+			settings,
+			settings.benchmark_tile_sizes,
+		)
+
 	enhancer: RealESRGANEnhancer | None = None
 	if apply_enhancement:
 		try:
 			enhancer = RealESRGANEnhancer(
 				model_url=settings.model_url,
+				tile_size=tile_size,
 				model_scale=settings.model_scale,
 				num_block=settings.model_num_block,
 			)
