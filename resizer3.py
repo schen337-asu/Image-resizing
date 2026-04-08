@@ -169,8 +169,8 @@ class MlxEnhancer:
         return Image.blend(baseline, enhanced, self.blend_strength)
 
 
-def show_settings_dialog() -> Settings:
-    """Open a single Tkinter dialog to collect all processing settings."""
+def show_settings_and_progress_dialog() -> Settings | None:
+    """Open a dialog that collects settings in one view, then shows progress in the same dialog."""
     root: tk.Tk | None = None
     result: Settings | None = None
 
@@ -203,7 +203,7 @@ def show_settings_dialog() -> Settings:
 
     try:
         root = tk.Tk()
-        root.title(f"Resizer3 Settings {RESIZER3_SUBVERSION}")
+        root.title(f"Resizer3 {RESIZER3_SUBVERSION}")
         root.resizable(False, False)
         root.attributes("-topmost", True)
 
@@ -218,6 +218,11 @@ def show_settings_dialog() -> Settings:
         outer.grid(row=0, column=0, sticky="nsew")
         outer.columnconfigure(0, weight=1)
 
+        # ===== SETTINGS MODE (initially visible) =====
+        settings_frame = ttk.Frame(outer)
+        settings_frame.grid(row=0, column=0, sticky="nsew")
+        settings_frame.columnconfigure(0, weight=1)
+
         def browse_for_directory(target: tk.StringVar, title: str) -> None:
             selected = filedialog.askdirectory(
                 parent=root,
@@ -228,7 +233,7 @@ def show_settings_dialog() -> Settings:
             if selected:
                 target.set(selected)
 
-        folders = ttk.LabelFrame(outer, text="Folders", padding=10)
+        folders = ttk.LabelFrame(settings_frame, text="Folders", padding=10)
         folders.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         folders.columnconfigure(0, weight=1)
 
@@ -248,12 +253,12 @@ def show_settings_dialog() -> Settings:
             command=lambda: browse_for_directory(destination_var, "Select destination folder for resized images"),
         ).grid(row=3, column=1)
 
-        resize = ttk.LabelFrame(outer, text="Resize", padding=10)
+        resize = ttk.LabelFrame(settings_frame, text="Resize", padding=10)
         resize.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         ttk.Label(resize, text="Multiplier ratio (e.g. 0.5, 1.25, 2):").grid(row=0, column=0, sticky="w")
         ttk.Entry(resize, textvariable=ratio_var, width=10).grid(row=0, column=1, padx=(10, 0), sticky="w")
 
-        enhancement = ttk.LabelFrame(outer, text="MLX Enhancement", padding=10)
+        enhancement = ttk.LabelFrame(settings_frame, text="MLX Enhancement", padding=10)
         enhancement.grid(row=2, column=0, sticky="ew", pady=(0, 10))
 
         ttk.Checkbutton(
@@ -284,8 +289,122 @@ def show_settings_dialog() -> Settings:
             if not enabled:
                 quant_var.set("off")
 
+        # ===== PROGRESS MODE (hidden initially) =====
+        progress_frame = ttk.Frame(outer)
+        progress_frame.columnconfigure(0, weight=1)
+
+        total = 0
+        counts: dict[str, int] = {"ok": 0, "skipped": 0, "failed": 0}
+        cancel_event = threading.Event()
+        progress_state = {"cancelled": False}
+
+        status_var = tk.StringVar(value="Starting...")
+        ttk.Label(progress_frame, textvariable=status_var, anchor="w", width=60).grid(
+            row=0, column=0, sticky="ew", pady=(0, 8)
+        )
+
+        progress_var = tk.IntVar(value=0)
+        progress_bar = ttk.Progressbar(
+            progress_frame, variable=progress_var, maximum=1, length=500, mode="determinate"
+        )
+        progress_bar.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+
+        counts_var = tk.StringVar(value="Success: 0   |   Skipped: 0   |   Failed: 0")
+        ttk.Label(progress_frame, textvariable=counts_var, anchor="w").grid(
+            row=2, column=0, sticky="w", pady=(0, 14)
+        )
+
+        button_row_progress = ttk.Frame(progress_frame)
+        button_row_progress.grid(row=3, column=0, sticky="e")
+        cancel_btn = ttk.Button(button_row_progress, text="Cancel")
+        cancel_btn.grid(row=0, column=0, padx=(0, 8))
+        close_btn = ttk.Button(button_row_progress, text="Close", command=root.destroy, state="disabled")
+        close_btn.grid(row=0, column=1)
+
+        def _request_cancel() -> None:
+            if progress_state["cancelled"]:
+                return
+            progress_state["cancelled"] = True
+            cancel_event.set()
+            cancel_btn.configure(state="disabled")
+            status_var.set("Cancelling... waiting for active work to stop")
+
+        cancel_btn.configure(command=_request_cancel)
+
+        def _update(done: int, filename: str, tag: str) -> None:
+            progress_var.set(done)
+            status_var.set(f"[{done}/{total}]  {tag}: {filename}")
+            counts_var.set(
+                f"Success: {counts['ok']}   |   Skipped: {counts['skipped']}   |   Failed: {counts['failed']}"
+            )
+
+        def _finish(processed: int) -> None:
+            if progress_state["cancelled"]:
+                status_var.set(
+                    f"Cancelled - processed {processed}/{total}. "
+                    f"{counts['ok']} succeeded, {counts['skipped']} skipped, {counts['failed']} failed."
+                )
+                root.title("Cancelled")
+            else:
+                status_var.set(
+                    f"Done - {counts['ok']} succeeded, {counts['skipped']} skipped, {counts['failed']} failed."
+                )
+                root.title("Done")
+            root.protocol("WM_DELETE_WINDOW", root.destroy)
+            cancel_btn.configure(state="disabled")
+            close_btn.configure(state="normal")
+
+        def _worker(images: list[Path], process_fn, parallel: bool, max_workers: int) -> None:
+            nonlocal total
+            total = len(images)
+            progress_var.set(0)
+            progress_bar.configure(maximum=total if total > 0 else 1)
+            processed = 0
+            if parallel and max_workers > 1:
+                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    future_to_path = {pool.submit(process_fn, p): p for p in images}
+                    for future in as_completed(future_to_path):
+                        if cancel_event.is_set():
+                            for pending in future_to_path:
+                                pending.cancel()
+                            break
+                        image_path = future_to_path[future]
+                        try:
+                            output_path = future.result()
+                            if output_path is None:
+                                counts["skipped"] += 1
+                                tag = "SKIPPED"
+                            else:
+                                counts["ok"] += 1
+                                tag = "OK"
+                        except CancelledError:
+                            continue
+                        except Exception as err:  # noqa: BLE001
+                            counts["failed"] += 1
+                            tag = f"FAILED ({err})"
+                        processed += 1
+                        root.after(0, _update, processed, image_path.name, tag)
+            else:
+                for image_path in images:
+                    if cancel_event.is_set():
+                        break
+                    try:
+                        output_path = process_fn(image_path)
+                        if output_path is None:
+                            counts["skipped"] += 1
+                            tag = "SKIPPED"
+                        else:
+                            counts["ok"] += 1
+                            tag = "OK"
+                    except Exception as err:  # noqa: BLE001
+                        counts["failed"] += 1
+                        tag = f"FAILED ({err})"
+                    processed += 1
+                    root.after(0, _update, processed, image_path.name, tag)
+                root.after(0, _finish, processed)
+
         def submit() -> None:
-            nonlocal result
+            nonlocal result, total
             source_value = source_var.get().strip()
             destination_value = destination_var.get().strip()
             if not source_value or not destination_value:
@@ -313,25 +432,88 @@ def show_settings_dialog() -> Settings:
                     messagebox.showerror("Invalid enhancement settings", str(err), parent=root)
                     return
 
+            source_path = Path(source_value).expanduser().resolve()
+            destination_path = Path(destination_value).expanduser().resolve()
+
+            if not source_path.exists() or not source_path.is_dir():
+                messagebox.showerror("Invalid source", f"'{source_path}' is not a valid directory.", parent=root)
+                return
+            if not destination_path.exists() or not destination_path.is_dir():
+                messagebox.showerror("Invalid destination", f"'{destination_path}' is not a valid directory.", parent=root)
+                return
+
+            try:
+                validate_destination_directory(source_path, destination_path)
+            except SystemExit as err:
+                messagebox.showerror("Invalid destination", str(err), parent=root)
+                return
+
+            # Scan for images
+            images = iter_jpegs(source_path)
+            if not images:
+                messagebox.showwarning("No images", "No JPEG files found in the source directory.", parent=root)
+                return
+
             result = Settings(
-                source=Path(source_value).expanduser().resolve(),
-                destination=Path(destination_value).expanduser().resolve(),
+                source=source_path,
+                destination=destination_path,
                 ratio=ratio,
                 apply_enhancement=apply_enhancement,
                 blend_strength=blend_strength,
                 quant_bits=quant_bits,
             )
-            root.withdraw()
-            root.quit()
+
+            # Switch from settings mode to progress mode
+            settings_frame.grid_remove()
+            progress_frame.grid(row=0, column=0, sticky="nsew")
+            root.title(f"Resizing Images... {RESIZER3_SUBVERSION}")
+            root.protocol("WM_DELETE_WINDOW", _request_cancel)
+
+            # Build the process function
+            enhancer: MlxEnhancer | None = None
+            if result.apply_enhancement:
+                try:
+                    enhancer = MlxEnhancer(
+                        blend_strength=result.blend_strength,
+                        quant_bits=result.quant_bits,
+                    )
+                except RuntimeError as err:
+                    status_var.set(f"Error: {err}")
+                    close_btn.configure(state="normal")
+                    return
+
+            destination_path.mkdir(parents=True, exist_ok=True)
+
+            def _process(image_path: Path) -> Path | None:
+                relative_parent = image_path.relative_to(source_path).parent
+                target_directory = destination_path / relative_parent
+                target_directory.mkdir(parents=True, exist_ok=True)
+                return resize_one_jpeg(
+                    image_path,
+                    result.ratio,
+                    result.apply_enhancement,
+                    target_directory,
+                    enhancer,
+                )
+
+            use_parallel = not result.apply_enhancement
+            max_workers = min(8, len(images) or 1) if use_parallel else 1
+
+            # Start background processing
+            threading.Thread(
+                target=_worker,
+                args=(images, _process, use_parallel, max_workers),
+                daemon=True
+            ).start()
 
         def cancel() -> None:
             root.withdraw()
             root.quit()
 
-        button_row = ttk.Frame(outer)
+        button_row = ttk.Frame(settings_frame)
         button_row.grid(row=3, column=0, sticky="e")
         ttk.Button(button_row, text="Cancel", command=cancel).grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(button_row, text="Continue", command=submit).grid(row=0, column=1)
+        ttk.Button(button_row, text="Start", command=submit).grid(row=0, column=1)
 
         root.columnconfigure(0, weight=1)
         root.protocol("WM_DELETE_WINDOW", cancel)
@@ -345,8 +527,6 @@ def show_settings_dialog() -> Settings:
         if root is not None:
             root.destroy()
 
-    if result is None:
-        raise SystemExit("Cancelled.")
     return result
 
 
@@ -393,193 +573,14 @@ def resize_one_jpeg(
         return output_path
 
 
-def show_progress_dialog(
-    images: list[Path],
-    process_fn,
-    *,
-    parallel: bool = False,
-    max_workers: int = 1,
-) -> None:
-    """Show a Tkinter progress window while images are processed in a background thread."""
-    total = len(images)
-    counts: dict[str, int] = {"ok": 0, "skipped": 0, "failed": 0}
-    cancel_event = threading.Event()
-    state = {"cancelled": False}
 
-    try:
-        root = tk.Tk()
-        root.title("Resizing Images...")
-        root.resizable(False, False)
-        root.attributes("-topmost", True)
-
-        outer = ttk.Frame(root, padding=16)
-        outer.grid(row=0, column=0, sticky="nsew")
-        outer.columnconfigure(0, weight=1)
-
-        status_var = tk.StringVar(value="Starting...")
-        ttk.Label(outer, textvariable=status_var, anchor="w", width=60).grid(
-            row=0, column=0, sticky="ew", pady=(0, 8)
-        )
-
-        progress_var = tk.IntVar(value=0)
-        ttk.Progressbar(
-            outer, variable=progress_var, maximum=total, length=500, mode="determinate"
-        ).grid(row=1, column=0, sticky="ew", pady=(0, 10))
-
-        counts_var = tk.StringVar(value="Success: 0   |   Skipped: 0   |   Failed: 0")
-        ttk.Label(outer, textvariable=counts_var, anchor="w").grid(
-            row=2, column=0, sticky="w", pady=(0, 14)
-        )
-
-        button_row = ttk.Frame(outer)
-        button_row.grid(row=3, column=0, sticky="e")
-        cancel_btn = ttk.Button(button_row, text="Cancel")
-        cancel_btn.grid(row=0, column=0, padx=(0, 8))
-        close_btn = ttk.Button(button_row, text="Close", command=root.destroy, state="disabled")
-        close_btn.grid(row=0, column=1)
-
-        def _request_cancel() -> None:
-            if state["cancelled"]:
-                return
-            state["cancelled"] = True
-            cancel_event.set()
-            cancel_btn.configure(state="disabled")
-            status_var.set("Cancelling... waiting for active work to stop")
-
-        cancel_btn.configure(command=_request_cancel)
-        root.protocol("WM_DELETE_WINDOW", _request_cancel)
-
-        def _update(done: int, filename: str, tag: str) -> None:
-            progress_var.set(done)
-            status_var.set(f"[{done}/{total}]  {tag}: {filename}")
-            counts_var.set(
-                f"Success: {counts['ok']}   |   Skipped: {counts['skipped']}   |   Failed: {counts['failed']}"
-            )
-
-        def _finish(processed: int) -> None:
-            if state["cancelled"]:
-                status_var.set(
-                    f"Cancelled - processed {processed}/{total}. "
-                    f"{counts['ok']} succeeded, {counts['skipped']} skipped, {counts['failed']} failed."
-                )
-                root.title("Cancelled")
-            else:
-                status_var.set(
-                    f"Done - {counts['ok']} succeeded, {counts['skipped']} skipped, {counts['failed']} failed."
-                )
-                root.title("Done")
-            root.protocol("WM_DELETE_WINDOW", root.destroy)
-            cancel_btn.configure(state="disabled")
-            close_btn.configure(state="normal")
-
-        def _worker() -> None:
-            processed = 0
-            if parallel and max_workers > 1:
-                with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                    future_to_path = {pool.submit(process_fn, p): p for p in images}
-                    for future in as_completed(future_to_path):
-                        if cancel_event.is_set():
-                            for pending in future_to_path:
-                                pending.cancel()
-                            break
-                        image_path = future_to_path[future]
-                        try:
-                            output_path = future.result()
-                            if output_path is None:
-                                counts["skipped"] += 1
-                                tag = "SKIPPED"
-                            else:
-                                counts["ok"] += 1
-                                tag = "OK"
-                        except CancelledError:
-                            continue
-                        except Exception as err:  # noqa: BLE001
-                            counts["failed"] += 1
-                            tag = f"FAILED ({err})"
-                        processed += 1
-                        root.after(0, _update, processed, image_path.name, tag)
-            else:
-                for image_path in images:
-                    if cancel_event.is_set():
-                        break
-                    try:
-                        output_path = process_fn(image_path)
-                        if output_path is None:
-                            counts["skipped"] += 1
-                            tag = "SKIPPED"
-                        else:
-                            counts["ok"] += 1
-                            tag = "OK"
-                    except Exception as err:  # noqa: BLE001
-                        counts["failed"] += 1
-                        tag = f"FAILED ({err})"
-                        processed += 1
-                        root.after(0, _update, processed, image_path.name, tag)
-                    root.after(0, _finish, processed)
-
-        threading.Thread(target=_worker, daemon=True).start()
-        root.mainloop()
-    except tk.TclError:
-        for i, image_path in enumerate(images, 1):
-            try:
-                output_path = process_fn(image_path)
-                if output_path is None:
-                    counts["skipped"] += 1
-                    status = "SKIPPED"
-                else:
-                    counts["ok"] += 1
-                    status = "OK"
-            except Exception as err:  # noqa: BLE001
-                counts["failed"] += 1
-                status = f"FAILED ({err})"
-            print(f"[{i}/{total}] {status}: {image_path.name}")
-        print(f"\nDone - {counts['ok']} succeeded, {counts['skipped']} skipped, {counts['failed']} failed.")
 
 
 def run() -> None:
-    """Collect settings from the dialog and process JPEG files."""
-    settings = show_settings_dialog()
-    directory = settings.source
-    output_directory = settings.destination
-
-    if not directory.exists() or not directory.is_dir():
-        raise SystemExit(f"Error: '{directory}' is not a valid directory.")
-    if not output_directory.exists() or not output_directory.is_dir():
-        raise SystemExit(f"Error: '{output_directory}' is not a valid directory.")
-    validate_destination_directory(directory, output_directory)
-
-    images = iter_jpegs(directory)
-    if not images:
-        raise SystemExit("No JPEG files (.jpg/.jpeg) found in the specified directory.")
-
-    enhancer: MlxEnhancer | None = None
-    if settings.apply_enhancement:
-        try:
-            enhancer = MlxEnhancer(
-                blend_strength=settings.blend_strength,
-                quant_bits=settings.quant_bits,
-            )
-        except RuntimeError as err:
-            raise SystemExit(f"Error: {err}") from err
-
-    output_directory.mkdir(parents=True, exist_ok=True)
-
-    use_parallel = not settings.apply_enhancement
-    max_workers = min(8, len(images) or 1) if use_parallel else 1
-
-    def _process(image_path: Path) -> Path | None:
-        relative_parent = image_path.relative_to(directory).parent
-        target_directory = output_directory / relative_parent
-        target_directory.mkdir(parents=True, exist_ok=True)
-        return resize_one_jpeg(
-            image_path,
-            settings.ratio,
-            settings.apply_enhancement,
-            target_directory,
-            enhancer,
-        )
-
-    show_progress_dialog(images, _process, parallel=use_parallel, max_workers=max_workers)
+    """Show the combined settings and progress dialog."""
+    settings = show_settings_and_progress_dialog()
+    if settings is None:
+        raise SystemExit("Cancelled.")
 
 
 if __name__ == "__main__":
