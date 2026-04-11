@@ -282,6 +282,17 @@ def show_settings_and_progress_dialog() -> Settings | None:
         )
         quant_combo.grid(row=2, column=1, sticky="w")
 
+        ttk.Label(
+            settings_frame,
+            text=(
+                "Note: Processing start may take some time depending on the number of images "
+                "to scan and prepare."
+            ),
+            justify="left",
+            foreground="#555555",
+            wraplength=520,
+        ).grid(row=3, column=0, sticky="w", pady=(0, 10))
+
         def _toggle_enhancement() -> None:
             enabled = enhance_var.get()
             blend_entry.configure(state="normal" if enabled else "disabled")
@@ -511,7 +522,7 @@ def show_settings_and_progress_dialog() -> Settings | None:
             root.quit()
 
         button_row = ttk.Frame(settings_frame)
-        button_row.grid(row=3, column=0, sticky="e")
+        button_row.grid(row=4, column=0, sticky="e")
         ttk.Button(button_row, text="Cancel", command=cancel).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(button_row, text="Start", command=submit).grid(row=0, column=1)
 
@@ -525,7 +536,11 @@ def show_settings_and_progress_dialog() -> Settings | None:
         return fallback_prompt()
     finally:
         if root is not None:
-            root.destroy()
+            try:
+                root.destroy()
+            except tk.TclError:
+                # Root may already be destroyed by a Close action.
+                pass
 
     return result
 
