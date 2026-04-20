@@ -587,10 +587,6 @@ def resize_one_jpeg(
         resized.save(output_path, **save_kwargs)
         return output_path
 
-
-
-
-
 def run() -> None:
     """Show the combined settings and progress dialog."""
     settings = show_settings_and_progress_dialog()
