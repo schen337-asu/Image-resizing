@@ -89,9 +89,12 @@ adds optional low-bit quantization controls for faster processing on Apple Silic
 
 Key `v3.1` capabilities:
 
-- One Tkinter settings dialog for source, destination, ratio, enhancement toggle, blend strength, and quantization mode.
-- MLX-based enhancement pipeline with quantization options: `off`, `8-bit`, `4-bit`.
-- Overall progress window with live status/counters and a `Cancel` button to stop jobs mid-run.
+- Dark-themed two-column interface: settings panel always visible on the left, live progress panel always visible on the right — no separate windows or mode switching.
+- Canvas-based progress bar with a centred percentage overlay (`%`) that updates in real time.
+- MLX-based enhancement pipeline with Apple activation quantization options: `off`, `8-bit`, `4-bit`.
+- Settings inputs (folders, ratio, enhancement) become disabled during processing so the run configuration stays readable while the job runs.
+- Live counters showing succeeded / skipped / failed counts as images are processed.
+- `Cancel` button stops the job mid-run; `Close` button appears when the run finishes.
 - Existing output files with matching names are skipped instead of overwritten.
 
 Run:
@@ -103,3 +106,4 @@ python resizer3.py
 Dependency note:
 
 - `resizer3.py` requires `mlx` (included in `requirements.txt`).
+- For full detail see `README_resizer3.md`.

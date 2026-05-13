@@ -17,7 +17,9 @@ It is designed to:
 ## Requirements
 
 - macOS (for native folder picker via `osascript`; fallback manual path input is supported)
-- Python 3.13+ recommended
+- Supported Python: 3.10–3.12
+- Recommended Python: 3.12.x
+- Python 3.13+ is not recommended (PyTorch/torchvision compatibility may vary)
 - Dependencies listed in `requirements.txt`
 
 ## Setup
